@@ -3,9 +3,10 @@
 #include <math.h>
 #include <stddef.h>
 #include <mpi.h>
+#include <omp.h>
 //set the safety stop for the divison to 50
 #define MAX_DEPTH 50
-
+#define OMP_TASK_DEPTH 4
 // Define tags for mode 2
 #define TAG_READY    100
 #define TAG_TASK     101
@@ -140,13 +141,25 @@ double f(double x, int func_id){
             return 0.0;
     }
 }
-//choose k for dynamic mode
+
+
+//choose k
+static int choose_serial_K(int func_id) {
+    if (func_id == 2) return 64;
+    return 16;
+}
 static int choose_dynamic_K(int size) {
     int workers = size - 1;
     int K = 4 * workers;
     return (K > 0) ? K : 1;
 }
 
+static int choose_hybrid_K(int size, int func_id) {
+    int workers = size;
+    int base = 8 * workers;
+    if (func_id == 2) base *= 2;
+    return (base > 0) ? base : 1;
+}
 //simpson estimate function on [a,b]
 double simpson_estimate(double a, double b, int func_id) {
     double m = 0.5 * (a + b);
@@ -412,6 +425,127 @@ void run_dynamic_master(int size, int func_id, double tol, double start_time,
     free_task_stack(&pool);
 }
 
+//Hybrid function implement static coarse interval distribution and local openMP computation
+//No sending sub intervals to master
+static void get_static_block(int total_items, int rank, int nranks,
+                             int *start_index, int *count) {
+    int base = total_items / nranks;
+    int extra = total_items % nranks;
+
+    if (rank < extra) {
+        *count = base + 1;
+        *start_index = rank * (*count);
+    } else {
+        *count = base;
+        *start_index = extra * (base + 1) + (rank - extra) * base;
+    }
+}
+
+double adaptive_simpson_hybrid(double a, double b, double tol, int func_id,
+                               long long *accepted_intervals, int depth) {
+    double m = 0.5 * (a + b);
+
+    double s_whole = simpson_estimate(a, b, func_id);
+    double s_left  = simpson_estimate(a, m, func_id);
+    double s_right = simpson_estimate(m, b, func_id);
+    double s_refined = s_left + s_right;
+
+    double err = fabs(s_refined - s_whole);
+
+    if (depth >= MAX_DEPTH || err <= tol) {
+        #pragma omp atomic update
+        (*accepted_intervals)++;
+        return s_refined;
+    }
+
+    if (depth < OMP_TASK_DEPTH) {
+        double left_sum = 0.0;
+        double right_sum = 0.0;
+
+        #pragma omp task shared(left_sum, accepted_intervals) firstprivate(a, m, tol, func_id, depth)
+        {
+            left_sum = adaptive_simpson_hybrid(a, m, tol / 2.0, func_id,
+                                               accepted_intervals, depth + 1);
+        }
+
+        #pragma omp task shared(right_sum, accepted_intervals) firstprivate(m, b, tol, func_id, depth)
+        {
+            right_sum = adaptive_simpson_hybrid(m, b, tol / 2.0, func_id,
+                                                accepted_intervals, depth + 1);
+        }
+
+        #pragma omp taskwait
+        return left_sum + right_sum;
+    } else {
+        return adaptive_simpson_hybrid(a, m, tol / 2.0, func_id,
+                                       accepted_intervals, depth + 1)
+             + adaptive_simpson_hybrid(m, b, tol / 2.0, func_id,
+                                       accepted_intervals, depth + 1);
+    }
+}
+void run_hybrid_worker(int rank, int size, int func_id, double tol,
+                       int chosen_K,
+                       double *local_sum, long long *local_accepted) {
+    int start_idx, count;
+    double width = 1.0 / (double)chosen_K;
+
+    *local_sum = 0.0;
+    *local_accepted = 0;
+
+    get_static_block(chosen_K, rank, size, &start_idx, &count);
+
+    #pragma omp parallel
+    {
+        #pragma omp single
+        {
+            for (int i = start_idx; i < start_idx + count; i++) {
+                double a = i * width;
+                double b = (i + 1) * width;
+                double local_tol = tol / (double)chosen_K;
+
+                #pragma omp task shared(local_sum, local_accepted) firstprivate(a, b, local_tol, func_id)
+                {
+                    double partial = adaptive_simpson_hybrid(a, b, local_tol,
+                                                             func_id, local_accepted, 0);
+
+                    #pragma omp atomic update
+                    *local_sum += partial;
+                }
+            }
+        }
+    }
+}
+void run_hybrid_master(int rank, int size, int func_id, double tol) {
+    int chosen_K = choose_hybrid_K(size, func_id);
+
+    double local_sum = 0.0;
+    double global_sum = 0.0;
+
+    long long local_accepted = 0;
+    long long global_accepted = 0;
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    double t0 = MPI_Wtime();
+
+    run_hybrid_worker(rank, size, func_id, tol, chosen_K, &local_sum, &local_accepted);
+
+    MPI_Reduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_accepted, &global_accepted, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    double t1 = MPI_Wtime();
+
+    if (rank == 0) {
+        printf("Mode: %d (Hybrid MPI + OpenMP)\n", 2);
+        printf("Processes: %d\n", size);
+        printf("Threads per process: %d\n", omp_get_max_threads());
+        printf("Function ID: %d\n", func_id);
+        printf("Tolerance: %.12e\n", tol);
+        printf("Chosen hybrid K: %d\n", chosen_K);
+        printf("Integral estimate: %.15f\n", global_sum);
+        printf("Accepted intervals: %lld\n", global_accepted);
+        printf("Runtime in seconds: %.6f\n", t1 - t0);
+    }
+}
 int main(int argc, char *argv[]) {
     int rank, size;
     MPI_Datatype TASK_TYPE, REPORT_TYPE;
@@ -426,7 +560,10 @@ int main(int argc, char *argv[]) {
         if (rank == 0) {
             fprintf(stderr,
                     "Command should be: mpirun -np P ./integration func_id mode tol\n"
-                    "Example: mpirun -np 4 ./integration 1 1 1e-8\n");
+                    "Examples:\n"
+                    "  mpirun -np 1 ./integration 1 0 1e-8\n"
+                    "  mpirun -np 4 ./integration 1 1 1e-8\n"
+                    "  OMP_NUM_THREADS=4 mpirun -np 4 ./integration 1 2 1e-8\n");
         }
         MPI_Type_free(&TASK_TYPE);
         MPI_Type_free(&REPORT_TYPE);
@@ -463,7 +600,7 @@ int main(int argc, char *argv[]) {
     //chekc if the mode is in the range of 0 to 2
     if (mode < 0 || mode > 2) {
         if (rank == 0) {
-            fprintf(stderr, "Mode must be 0 or 1 in this cleaned base version\n");
+            fprintf(stderr, "mode must be 0, 1, or 2\n");
         }
         MPI_Type_free(&TASK_TYPE);
         MPI_Type_free(&REPORT_TYPE);
@@ -488,7 +625,8 @@ int main(int argc, char *argv[]) {
             printf("Accepted intervals: %lld\n", accepted_intervals);
             printf("Runtime in seconds: %.6f\n", t1 - t0);
         }
-    } else if (mode == 1) {
+    }
+    else if (mode == 1) {
         if (size < 2) {
             if (rank == 0) {
                 fprintf(stderr, "Mode 1 needs at least 2 MPI processes.\n");
@@ -530,17 +668,14 @@ int main(int argc, char *argv[]) {
             printf("Accepted intervals: %lld\n", global_accepted);
             printf("Runtime in seconds: %.6f\n", global_runtime);
 
-            printf("Per-worker dynamic work:\n");
-            for (int r = 1; r < size; r++) {
-                printf("  Worker %d -> tasks assigned: %d, accepted intervals: %lld, active compute time (s): %.6f\n",
-                       r, worker_task_counts[r], worker_reports[r].accepted, worker_reports[r].active_time);
-            }
-
             free(worker_reports);
             free(worker_task_counts);
         } else {
             run_dynamic_worker(func_id, TASK_TYPE, REPORT_TYPE);
         }
+    }
+    else if (mode == 2) {
+        run_hybrid_master(rank, size, func_id, tol);
     }
 
     MPI_Type_free(&TASK_TYPE);
