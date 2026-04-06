@@ -155,7 +155,7 @@ static int choose_dynamic_K(int size) {
 }
 
 static int choose_hybrid_K(int size, int func_id) {
-    int workers = size;
+    int workers = size - 1;
     int base = 8 * workers;
     if (func_id == 2) base *= 2;
     return (base > 0) ? base : 1;
@@ -282,12 +282,13 @@ void run_dynamic_worker(int func_id, MPI_Datatype TASK_TYPE, MPI_Datatype REPORT
                     local_report.accepted++;
                 } else {
                     Task left_child;
+                    Task right_child;
+
                     left_child.a = a;
                     left_child.b = m;
                     left_child.tol = tol / 2.0;
                     left_child.depth = depth + 1;
 
-                    Task right_child;
                     right_child.a = m;
                     right_child.b = b;
                     right_child.tol = tol / 2.0;
@@ -486,13 +487,20 @@ double adaptive_simpson_hybrid(double a, double b, double tol, int func_id,
 void run_hybrid_worker(int rank, int size, int func_id, double tol,
                        int chosen_K,
                        double *local_sum, long long *local_accepted) {
-    int start_idx, count;
-    double width = 1.0 / (double)chosen_K;
-
     *local_sum = 0.0;
     *local_accepted = 0;
 
-    get_static_block(chosen_K, rank, size, &start_idx, &count);
+    if (rank == 0) {
+        return;
+    }
+
+    int workers = size - 1;
+    int worker_rank = rank - 1;
+
+    int start_idx, count;
+    double width = 1.0 / (double)chosen_K;
+
+    get_static_block(chosen_K, worker_rank, workers, &start_idx, &count);
 
     #pragma omp parallel
     {
@@ -537,7 +545,8 @@ void run_hybrid_master(int rank, int size, int func_id, double tol) {
     if (rank == 0) {
         printf("Mode: %d (Hybrid MPI + OpenMP)\n", 2);
         printf("Processes: %d\n", size);
-        printf("Threads per process: %d\n", omp_get_max_threads());
+        printf("Worker processes: %d\n", size - 1);
+        printf("Threads per worker: %d\n", omp_get_max_threads());
         printf("Function ID: %d\n", func_id);
         printf("Tolerance: %.12e\n", tol);
         printf("Chosen hybrid K: %d\n", chosen_K);
@@ -675,6 +684,17 @@ int main(int argc, char *argv[]) {
         }
     }
     else if (mode == 2) {
+        if (size < 2) {
+			//Ensures we have atleast two processes (master & worker)
+            if (rank == 0) {
+                fprintf(stderr, "Mode 2 needs at least 2 MPI processes.\n");
+            }
+            MPI_Type_free(&TASK_TYPE);
+            MPI_Type_free(&REPORT_TYPE);
+            MPI_Finalize();
+            return 1;
+        }
+
         run_hybrid_master(rank, size, func_id, tol);
     }
 
