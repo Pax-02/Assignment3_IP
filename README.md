@@ -107,6 +107,10 @@ OMPI_CC=gcc-15 mpicc -fopenmp integration.c -lm -o integration
 
     mpirun (Open MPI) 5.0.9
 
+## Github Link
+
+https://github.com/Pax-02/Assignment3_IP.git
+
 ## Authorship Statement
 
 I Ishimwe Pacis Hanyurwimfura confirm that :
